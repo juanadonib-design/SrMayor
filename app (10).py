@@ -192,6 +192,15 @@ def _read_xlsx_stdlib(data: bytes) -> dict:
         return out
  
  
+def _xlrd_diagnostic() -> tuple[bool, str]:
+    """Comprueba si xlrd está disponible y devuelve información útil del entorno."""
+    try:
+        import xlrd
+        return True, f"xlrd {getattr(xlrd, '__version__', 'versión desconocida')}"
+    except ImportError:
+        return False, "xlrd no está instalado en el entorno de ejecución."
+
+
 def _read_all_sheets(data: bytes, filename: str):
     es_xlsx = data[:2] == b"PK"  # los .xlsx son ZIP, aunque el nombre diga .xls
  
@@ -208,7 +217,17 @@ def _read_all_sheets(data: bytes, filename: str):
             raise ValueError(f"No se pudo leer el archivo Excel: {exc}")
  
     # .xls clásico: xlrd es una dependencia obligatoria del proyecto.
-    # Está declarada en requirements.txt, por lo que debe instalarse durante el despliegue.
+    ok_xlrd, xlrd_info = _xlrd_diagnostic()
+    if not ok_xlrd:
+        raise RuntimeError(
+            "No se puede abrir este archivo .xls porque «xlrd» no está disponible "
+            "en el servidor.\n\n"
+            "Diagnóstico: " + xlrd_info + "\n"
+            "Solución: asegúrate de que el repositorio tenga un archivo llamado "
+            "requirements.txt en la raíz con «xlrd>=2.0.1» y vuelve a desplegar "
+            "la aplicación. No es necesario convertir el .xls a .xlsx."
+        )
+
     try:
         return pd.read_excel(
             io.BytesIO(data),
@@ -219,12 +238,13 @@ def _read_all_sheets(data: bytes, filename: str):
         )
     except ImportError as exc:
         raise RuntimeError(
-            "La dependencia obligatoria «xlrd» no está instalada. "
-            "Verifica que requirements.txt incluya «xlrd>=2.0.1» "
-            "y vuelve a desplegar la aplicación."
+            f"No se pudo cargar xlrd ({xlrd_info}). "
+            "Verifica requirements.txt y vuelve a desplegar."
         ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"No se pudo leer el archivo Excel .xls: {exc}")
+        raise ValueError(
+            f"No se pudo leer el archivo Excel .xls usando {xlrd_info}: {exc}"
+        )
  
  
 def extract_reviewed(data: bytes, filename: str):
@@ -362,6 +382,18 @@ st.caption(
     "**Verdadero** y se extraen sus **Códigos**."
 )
  
+ok_xlrd, xlrd_info = _xlrd_diagnostic()
+with st.expander("🔧 Diagnóstico de compatibilidad .xls", expanded=False):
+    if ok_xlrd:
+        st.success(f"Compatibilidad .xls activa: {xlrd_info}")
+    else:
+        st.error("Compatibilidad .xls no disponible: xlrd no está instalado.")
+        st.code("xlrd>=2.0.1")
+        st.caption(
+            "Coloca esta dependencia en requirements.txt, en la raíz del repositorio, "
+            "y vuelve a desplegar la aplicación. Los archivos .xls no necesitan convertirse a .xlsx."
+        )
+
 origen = st.radio("Origen del archivo", ["Subir archivo", "Desde GitHub"], horizontal=True)
  
 data, fname = None, None
