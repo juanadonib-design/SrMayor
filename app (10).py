@@ -207,19 +207,24 @@ def _read_all_sheets(data: bytes, filename: str):
         except Exception as exc:  # noqa: BLE001
             raise ValueError(f"No se pudo leer el archivo Excel: {exc}")
  
-    # .xls clásico: requiere xlrd
-    for attempt in (1, 2):
-        try:
-            return pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, engine="xlrd", dtype=object)
-        except ImportError:
-            if attempt == 1 and _try_pip_install("xlrd"):
-                continue
-            raise ValueError(
-                "Los archivos .xls antiguos necesitan la librería xlrd, que no está instalada en este "
-                "servidor. Abre el archivo en Excel, usa «Guardar como» → .xlsx y súbelo de nuevo."
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError(f"No se pudo leer el archivo Excel: {exc}")
+    # .xls clásico: xlrd es una dependencia obligatoria del proyecto.
+    # Está declarada en requirements.txt, por lo que debe instalarse durante el despliegue.
+    try:
+        return pd.read_excel(
+            io.BytesIO(data),
+            sheet_name=None,
+            header=None,
+            engine="xlrd",
+            dtype=object,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "La dependencia obligatoria «xlrd» no está instalada. "
+            "Verifica que requirements.txt incluya «xlrd>=2.0.1» "
+            "y vuelve a desplegar la aplicación."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"No se pudo leer el archivo Excel .xls: {exc}")
  
  
 def extract_reviewed(data: bytes, filename: str):
@@ -353,7 +358,7 @@ def copy_list_component(records: list[tuple[str, str]]):
 # ----------------------------------------------------------------------------
 st.title("✅ Extractor de Códigos Revisados")
 st.caption(
-    "Sube un Excel (.xlsx / .xls). Se busca la columna **Revisada**, se toman las filas con "
+    "Sube un Excel (.xlsx / .xls). Ambos formatos son compatibles. Se busca la columna **Revisada**, se toman las filas con "
     "**Verdadero** y se extraen sus **Códigos**."
 )
  
