@@ -1,5 +1,5 @@
 """Lógica de lectura y extracción de códigos revisados desde archivos Excel.
- 
+
 - Lee .xlsx y .xls (todas las hojas).
 - Detecta automáticamente la fila de encabezados (donde estén "Revisada" y "Código").
 - Extrae los códigos de las filas donde Revisada = Verdadero.
@@ -8,17 +8,17 @@
 import io
 import re
 import unicodedata
- 
+
 import numpy as np
 import pandas as pd
- 
+
 COL_HOJA = "Hoja"
 COL_CODIGO = "Código"
 COL_LIBRAMIENTO = "Número Libramiento"
- 
+
 _TRUE_VALUES = {"verdadero", "true"}
- 
- 
+
+
 def norm(value) -> str:
     """Minúsculas, sin acentos y sin espacios repetidos."""
     if value is None:
@@ -31,8 +31,8 @@ def norm(value) -> str:
     s = unicodedata.normalize("NFKD", str(value))
     s = "".join(c for c in s if not unicodedata.combining(c))
     return re.sub(r"\s+", " ", s).strip().lower()
- 
- 
+
+
 def clean_value(value) -> str:
     """Convierte una celda a texto limpio (123.0 -> '123')."""
     if value is None:
@@ -46,14 +46,14 @@ def clean_value(value) -> str:
         return str(int(value))
     s = str(value).strip()
     return "" if s.lower() in {"nan", "none", "nat"} else s
- 
- 
+
+
 def is_true(value) -> bool:
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
     return norm(value) in _TRUE_VALUES
- 
- 
+
+
 def _find(headers, exact=(), startswith=(), contains=()):
     for i, h in enumerate(headers):
         if h in exact:
@@ -65,8 +65,8 @@ def _find(headers, exact=(), startswith=(), contains=()):
         if any(c in h for c in contains):
             return i
     return None
- 
- 
+
+
 def _find_header_row(raw: pd.DataFrame, max_rows: int = 40):
     for i in range(min(max_rows, len(raw))):
         headers = [norm(v) for v in raw.iloc[i].tolist()]
@@ -75,22 +75,50 @@ def _find_header_row(raw: pd.DataFrame, max_rows: int = 40):
         if i_rev is not None and i_cod is not None:
             return i, headers, i_rev, i_cod
     return None
- 
- 
+
+
+def _try_pip_install(package: str) -> bool:
+    """Instala un paquete con el pip del intérprete actual. True si quedó importable."""
+    import importlib
+    import subprocess
+    import sys
+
+    cmds = [
+        [sys.executable, "-m", "pip", "install", "--quiet", package],
+        [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", package],
+        [sys.executable, "-m", "pip", "install", "--quiet", "--user", package],
+    ]
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=180)
+        except Exception:  # noqa: BLE001
+            continue
+        if r.returncode == 0:
+            importlib.invalidate_caches()
+            return True
+    return False
+
+
 def _read_all_sheets(data: bytes, filename: str):
     ext = filename.lower().rsplit(".", 1)[-1]
     engines = ["xlrd", "openpyxl"] if ext == "xls" else ["openpyxl", "xlrd"]
     last_error = None
     missing = []
     for engine in engines:
-        try:
-            return pd.read_excel(
-                io.BytesIO(data), sheet_name=None, header=None, engine=engine, dtype=object
-            )
-        except ImportError:
-            missing.append(engine)
-        except Exception as exc:  # noqa: BLE001 - probamos el otro motor
-            last_error = exc
+        for attempt in (1, 2):
+            try:
+                return pd.read_excel(
+                    io.BytesIO(data), sheet_name=None, header=None, engine=engine, dtype=object
+                )
+            except ImportError:
+                # Si el hosting no instaló requirements.txt, intentamos instalarla una vez.
+                if attempt == 1 and _try_pip_install(engine):
+                    continue
+                missing.append(engine)
+                break
+            except Exception as exc:  # noqa: BLE001 - probamos el otro motor
+                last_error = exc
+                break
     if missing and last_error is None:
         raise ValueError(
             f"Falta instalar la librería: {' y '.join(missing)}. "
@@ -103,16 +131,16 @@ def _read_all_sheets(data: bytes, filename: str):
             f"Además falta instalar: {' y '.join(missing)} (pip install {' '.join(missing)})."
         )
     raise ValueError(f"No se pudo leer el archivo Excel: {last_error}")
- 
- 
+
+
 def extract_reviewed(data: bytes, filename: str):
     """Devuelve (DataFrame, hay_libramiento, notas).
- 
+
     El DataFrame tiene las columnas: Hoja, Código, Número Libramiento.
     """
     sheets = _read_all_sheets(data, filename)
     frames, notes, has_lib = [], [], False
- 
+
     for name, raw in sheets.items():
         found = _find_header_row(raw)
         if found is None:
@@ -121,7 +149,7 @@ def extract_reviewed(data: bytes, filename: str):
         h, headers, i_rev, i_cod = found
         i_lib = _find(headers, exact=("numero libramiento",), contains=("libramiento",))
         has_lib = has_lib or i_lib is not None
- 
+
         body = raw.iloc[h + 1 :]
         sel = body[body.iloc[:, i_rev].map(is_true)]
         out = pd.DataFrame(
@@ -133,15 +161,15 @@ def extract_reviewed(data: bytes, filename: str):
         )
         out = out[out[COL_CODIGO] != ""]
         frames.append(out)
- 
+
     if not frames:
         raise ValueError(
             "No se encontró ninguna hoja con las columnas «Revisada» y «Código». "
             + " ".join(notes)
         )
     return pd.concat(frames, ignore_index=True), has_lib, notes
- 
- 
+
+
 def filter_by_libramiento(df: pd.DataFrame, text: str) -> pd.DataFrame:
     """Filtra por uno o varios Números de Libramiento (separados por coma, espacio o ;)."""
     tokens = {norm(t) for t in re.split(r"[,\s;]+", text.strip()) if t}
