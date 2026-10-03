@@ -3,6 +3,7 @@
 - Lee .xlsx y .xls (todas las hojas).
 - Detecta automáticamente la fila de encabezados (donde estén "Revisada" y "Código").
 - Extrae los códigos de las filas donde Revisada = Verdadero.
+- Permite subir varios archivos e identificar los registros nuevos respecto a otros documentos.
 - Permite filtrar por Número Libramiento y copiar cada registro.
  
 Ejecutar:  streamlit run app.py
@@ -15,7 +16,6 @@ import unicodedata
  
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 import streamlit.components.v1 as components
  
@@ -85,27 +85,6 @@ def _find_header_row(raw: pd.DataFrame, max_rows: int = 40):
         if i_rev is not None and i_cod is not None:
             return i, headers, i_rev, i_cod
     return None
- 
- 
-def _try_pip_install(package: str) -> bool:
-    """Intenta instalar un paquete con pip (una vez, con tiempo límite). True si quedó importable."""
-    import importlib
-    import subprocess
-    import sys
- 
-    for extra in ([], ["--break-system-packages"], ["--user"]):
-        try:
-            r = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet", *extra, package],
-                capture_output=True,
-                timeout=60,
-            )
-        except Exception:  # noqa: BLE001
-            return False
-        if r.returncode == 0:
-            importlib.invalidate_caches()
-            return True
-    return False
  
  
 def _col_index(ref: str) -> int:
@@ -192,61 +171,364 @@ def _read_xlsx_stdlib(data: bytes) -> dict:
         return out
  
  
-def _xlrd_diagnostic() -> tuple[bool, str]:
-    """Comprueba si xlrd está disponible y devuelve información útil del entorno."""
-    try:
-        import xlrd
-        return True, f"xlrd {getattr(xlrd, '__version__', 'versión desconocida')}"
-    except ImportError:
-        return False, "xlrd no está instalado en el entorno de ejecución."
+_OLE_SIG = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _ole_stream(data: bytes, wanted=("workbook", "book")) -> bytes:
+    """Extrae el stream 'Workbook' de un contenedor OLE2 (.xls) sin librerías externas."""
+    import struct
+
+    if data[:8] != _OLE_SIG:
+        raise ValueError("El archivo no es un .xls válido.")
+    ssz = 1 << struct.unpack_from("<H", data, 0x1E)[0]
+    mssz = 1 << struct.unpack_from("<H", data, 0x20)[0]
+    n_fat, dir_start = struct.unpack_from("<II", data, 0x2C)
+    mini_cutoff = struct.unpack_from("<I", data, 0x38)[0]
+    minifat_start, _n_minifat, difat_start, n_difat = struct.unpack_from("<IIII", data, 0x3C)
+    FREE = 0xFFFFFFFA  # valores >= FREE son marcas especiales (fin de cadena, libre, FAT...)
+
+    def sector(i):
+        off = (i + 1) * ssz
+        return data[off : off + ssz]
+
+    def words(buf):
+        return struct.unpack("<%dI" % (len(buf) // 4), buf[: len(buf) // 4 * 4])
+
+    difat = list(struct.unpack_from("<109I", data, 0x4C))
+    s = difat_start
+    for _ in range(n_difat):
+        if s >= FREE:
+            break
+        w = words(sector(s))
+        difat.extend(w[:-1])
+        s = w[-1]
+    fat = []
+    for fs in [x for x in difat if x < FREE][:n_fat]:
+        fat.extend(words(sector(fs)))
+
+    def chain(start, table):
+        out, guard = [], 0
+        while start < FREE and start < len(table) and guard <= len(table):
+            out.append(start)
+            start = table[start]
+            guard += 1
+        return out
+
+    def read_chain(start):
+        return b"".join(sector(i) for i in chain(start, fat))
+
+    dir_data = read_chain(dir_start)
+    entries = []
+    for off in range(0, len(dir_data) - 127, 128):
+        e = dir_data[off : off + 128]
+        nlen = struct.unpack_from("<H", e, 0x40)[0]
+        name = e[: max(nlen - 2, 0)].decode("utf-16-le", "ignore")
+        start = struct.unpack_from("<I", e, 0x74)[0]
+        size = struct.unpack_from("<I", e, 0x78)[0]
+        entries.append((name, e[0x42], start, size))
+
+    root = next((e for e in entries if e[1] == 5), None)
+    target = next((e for e in entries if e[1] == 2 and e[0].lower() in wanted), None)
+    if target is None:
+        raise ValueError("El archivo no contiene un libro de Excel (.xls) legible.")
+    _, _, start, size = target
+    if size >= mini_cutoff or root is None:
+        return read_chain(start)[:size]
+
+    minifat = []
+    for s in chain(minifat_start, fat):
+        minifat.extend(words(sector(s)))
+    container = read_chain(root[2])
+    parts = [container[i * mssz : (i + 1) * mssz] for i in chain(start, minifat)]
+    return b"".join(parts)[:size]
+
+
+class _Cur:
+    """Cursor sobre varios bloques (registro + CONTINUE) para leer cadenas BIFF8."""
+
+    def __init__(self, chunks, pos=0):
+        self.chunks, self.ci, self.pos = chunks, 0, pos
+
+    def avail(self):
+        return len(self.chunks[self.ci]) - self.pos
+
+    def advance(self):
+        self.ci += 1
+        self.pos = 0
+        if self.ci >= len(self.chunks):
+            raise EOFError
+
+    def take(self, n):
+        out = b""
+        while n > 0:
+            if self.avail() <= 0:
+                self.advance()
+            k = min(n, self.avail())
+            out += self.chunks[self.ci][self.pos : self.pos + k]
+            self.pos += k
+            n -= k
+        return out
+
+
+def _biff8_string(cur: _Cur, long_len: bool = True) -> str:
+    import struct
+
+    if long_len:
+        cch, flags = struct.unpack("<HB", cur.take(3))
+    else:
+        cch, flags = struct.unpack("<BB", cur.take(2))
+    runs = struct.unpack("<H", cur.take(2))[0] if flags & 8 else 0
+    ext = struct.unpack("<I", cur.take(4))[0] if flags & 4 else 0
+    is16, need, parts = flags & 1, cch, []
+    while need > 0:
+        width = 2 if is16 else 1
+        if cur.avail() < width:  # la cadena continúa en un bloque CONTINUE (con byte de opciones)
+            cur.advance()
+            is16 = cur.chunks[cur.ci][0] & 1
+            cur.pos = 1
+            width = 2 if is16 else 1
+        k = min(need, cur.avail() // width)
+        raw = cur.chunks[cur.ci][cur.pos : cur.pos + k * width]
+        cur.pos += k * width
+        parts.append(raw.decode("utf-16-le", "replace") if is16 else raw.decode("latin-1"))
+        need -= k
+    cur.take(runs * 4 + ext)
+    return "".join(parts)
+
+
+def _rk_value(v: int) -> float:
+    import struct
+
+    if v & 2:
+        n = ((v - (1 << 32)) if v & 0x80000000 else v) >> 2
+        n = float(n)
+    else:
+        n = struct.unpack("<d", struct.pack("<Q", (v & 0xFFFFFFFC) << 32))[0]
+    return n / 100 if v & 1 else n
+
+
+def _read_xls_stdlib(data: bytes) -> dict:
+    """Lector de .xls (BIFF5/BIFF8) sin dependencias. Devuelve {hoja: DataFrame}."""
+    import struct
+
+    buf = _ole_stream(data)
+    n = len(buf)
+
+    def records(pos):
+        while pos + 4 <= n:
+            rid, ln = struct.unpack_from("<HH", buf, pos)
+            yield rid, buf[pos + 4 : pos + 4 + ln]
+            pos += 4 + ln
+
+    # ---- Sección global: versión, hojas y tabla de cadenas compartidas
+    biff8, sheets, sst, recs = True, [], [], []
+    depth = 0
+    for rid, p in records(0):
+        if rid == 0x0809:
+            depth += 1
+            if depth == 1 and len(p) >= 2:
+                biff8 = struct.unpack_from("<H", p, 0)[0] >= 0x0600
+        elif rid == 0x000A:
+            depth -= 1
+            if depth <= 0:
+                break
+        elif rid == 0x002F:
+            raise ValueError("El archivo .xls está protegido con contraseña.")
+        recs.append((rid, p))
+
+    i = 0
+    while i < len(recs):
+        rid, p = recs[i]
+        if rid == 0x0085 and len(p) >= 8:
+            off, _vis, typ = struct.unpack_from("<IBB", p, 0)
+            if biff8:
+                name = _biff8_string(_Cur([p], 6), long_len=False)
+            else:
+                name = p[7 : 7 + p[6]].decode("cp1252", "replace")
+            if typ == 0:
+                sheets.append((name, off))
+        elif rid == 0x00FC:
+            chunks = [p]
+            while i + 1 < len(recs) and recs[i + 1][0] == 0x003C:
+                i += 1
+                chunks.append(recs[i][1])
+            try:
+                cur = _Cur(chunks, 8)
+                for _ in range(struct.unpack_from("<I", p, 4)[0]):
+                    sst.append(_biff8_string(cur))
+            except (EOFError, struct.error):
+                pass
+        i += 1
+
+    def text(p, start):
+        if biff8:
+            return _biff8_string(_Cur([p], start))
+        ln = struct.unpack_from("<H", p, start)[0]
+        return p[start + 2 : start + 2 + ln].decode("cp1252", "replace")
+
+    # ---- Hojas
+    out = {}
+    for sname, soff in sheets:
+        cells, pending, depth = {}, None, 0
+        for rid, p in records(soff):
+            try:
+                if rid == 0x0809:
+                    depth += 1
+                elif rid == 0x000A:
+                    depth -= 1
+                    if depth <= 0:
+                        break
+                elif depth != 1:
+                    continue
+                elif rid == 0x00FD:  # LABELSST
+                    r, c, _x, k = struct.unpack_from("<HHHI", p, 0)
+                    if k < len(sst):
+                        cells[(r, c)] = sst[k]
+                elif rid == 0x0204:  # LABEL
+                    r, c = struct.unpack_from("<HH", p, 0)
+                    cells[(r, c)] = text(p, 6)
+                elif rid == 0x0203:  # NUMBER
+                    r, c, _x, v = struct.unpack_from("<HHHd", p, 0)
+                    cells[(r, c)] = v
+                elif rid == 0x027E:  # RK
+                    r, c, _x, v = struct.unpack_from("<HHHI", p, 0)
+                    cells[(r, c)] = _rk_value(v)
+                elif rid == 0x00BD:  # MULRK
+                    r, c1 = struct.unpack_from("<HH", p, 0)
+                    for k in range((len(p) - 6) // 6):
+                        _x, v = struct.unpack_from("<HI", p, 4 + 6 * k)
+                        cells[(r, c1 + k)] = _rk_value(v)
+                elif rid == 0x0205:  # BOOLERR
+                    r, c, _x, v, is_err = struct.unpack_from("<HHHBB", p, 0)
+                    if not is_err:
+                        cells[(r, c)] = bool(v)
+                elif rid == 0x0006:  # FORMULA
+                    r, c = struct.unpack_from("<HH", p, 0)
+                    res = p[6:14]
+                    if res[6:8] == b"\xff\xff":
+                        if res[0] == 0:
+                            pending = (r, c)
+                        elif res[0] == 1:
+                            cells[(r, c)] = bool(res[2])
+                    else:
+                        cells[(r, c)] = struct.unpack("<d", res)[0]
+                elif rid == 0x0207 and pending is not None:  # STRING (resultado de fórmula)
+                    cells[pending] = text(p, 0)
+                    pending = None
+            except (struct.error, EOFError, IndexError):
+                continue
+        if not cells:
+            out[sname] = pd.DataFrame()
+            continue
+        n_rows = max(r for r, _ in cells) + 1
+        n_cols = max(c for _, c in cells) + 1
+        grid = [[None] * n_cols for _ in range(n_rows)]
+        for (r, c), v in cells.items():
+            grid[r][c] = v
+        out[sname] = pd.DataFrame(grid, dtype=object)
+    if not out:
+        raise ValueError("El archivo .xls no tiene hojas de cálculo legibles.")
+    return out
+
+
+def _decode_text(data: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-16", "cp1252"):
+        try:
+            return data.decode(enc)
+        except UnicodeError:
+            continue
+    return data.decode("latin-1", "replace")
+
+
+def _read_html_tables(data: bytes) -> dict:
+    """Muchos sistemas exportan HTML con extensión .xls: se leen sus tablas."""
+    from html.parser import HTMLParser
+
+    class _P(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.tables, self.stack, self.row, self.cell = [], [], None, None
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "table":
+                self.stack.append([])
+            elif tag == "tr" and self.stack:
+                self.row = []
+            elif tag in ("td", "th") and self.row is not None:
+                self.cell = []
+            elif tag == "br" and self.cell is not None:
+                self.cell.append(" ")
+
+        def handle_endtag(self, tag):
+            if tag in ("td", "th") and self.cell is not None and self.row is not None:
+                self.row.append(" ".join("".join(self.cell).split()))
+                self.cell = None
+            elif tag == "tr" and self.row is not None and self.stack:
+                self.stack[-1].append(self.row)
+                self.row = None
+            elif tag == "table" and self.stack:
+                self.tables.append(self.stack.pop())
+
+        def handle_data(self, d):
+            if self.cell is not None:
+                self.cell.append(d)
+
+    p = _P()
+    p.feed(_decode_text(data))
+    out = {}
+    for k, rows in enumerate((t for t in p.tables if t), start=1):
+        width = max(len(r) for r in rows)
+        out[f"Tabla{k}"] = pd.DataFrame([r + [None] * (width - len(r)) for r in rows], dtype=object)
+    return out
+
+
+def _read_delimited(data: bytes) -> dict:
+    import csv
+
+    txt = _decode_text(data)
+    first = txt.splitlines()[0] if txt.strip() else ""
+    delim = max("\t;,|", key=first.count)
+    rows = list(csv.reader(io.StringIO(txt), delimiter=delim))
+    if not rows:
+        return {}
+    width = max(len(r) for r in rows)
+    return {"Hoja1": pd.DataFrame([r + [None] * (width - len(r)) for r in rows], dtype=object)}
 
 
 def _read_all_sheets(data: bytes, filename: str):
-    es_xlsx = data[:2] == b"PK"  # los .xlsx son ZIP, aunque el nombre diga .xls
- 
-    if es_xlsx:
+    head = data[:8]
+
+    # .xlsx (ZIP), aunque el nombre diga .xls
+    if head[:2] == b"PK":
         try:
             return pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, engine="openpyxl", dtype=object)
-        except ImportError:
-            pass  # sin openpyxl: usamos el lector propio
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - sin openpyxl o archivo raro: lector propio
             pass
         try:
             return _read_xlsx_stdlib(data)
         except Exception as exc:  # noqa: BLE001
             raise ValueError(f"No se pudo leer el archivo Excel: {exc}")
- 
-    # .xls clásico: xlrd es una dependencia obligatoria del proyecto.
-    ok_xlrd, xlrd_info = _xlrd_diagnostic()
-    if not ok_xlrd:
-        raise RuntimeError(
-            "No se puede abrir este archivo .xls porque «xlrd» no está disponible "
-            "en el servidor.\n\n"
-            "Diagnóstico: " + xlrd_info + "\n"
-            "Solución: asegúrate de que el repositorio tenga un archivo llamado "
-            "requirements.txt en la raíz con «xlrd>=2.0.1» y vuelve a desplegar "
-            "la aplicación. No es necesario convertir el .xls a .xlsx."
-        )
 
-    try:
-        return pd.read_excel(
-            io.BytesIO(data),
-            sheet_name=None,
-            header=None,
-            engine="xlrd",
-            dtype=object,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            f"No se pudo cargar xlrd ({xlrd_info}). "
-            "Verifica requirements.txt y vuelve a desplegar."
-        ) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(
-            f"No se pudo leer el archivo Excel .xls usando {xlrd_info}: {exc}"
-        )
- 
- 
+    # .xls clásico (OLE2)
+    if head == _OLE_SIG:
+        try:
+            return pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, engine="xlrd", dtype=object)
+        except Exception:  # noqa: BLE001 - sin xlrd o archivo raro: lector propio
+            pass
+        try:
+            return _read_xls_stdlib(data)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"No se pudo leer el archivo .xls: {exc}")
+
+    # .xls que en realidad es HTML o texto delimitado (exportaciones de sistemas)
+    sheets = _read_html_tables(data) if b"<" in data[:2000] else {}
+    if not sheets:
+        sheets = _read_delimited(data)
+    if not sheets:
+        raise ValueError("No se reconoce el formato del archivo (se esperaba .xlsx o .xls).")
+    return sheets
+
+
 def extract_reviewed(data: bytes, filename: str):
     """Devuelve (DataFrame, hay_libramiento, notas).
  
@@ -290,46 +572,40 @@ def filter_by_libramiento(df: pd.DataFrame, text: str) -> pd.DataFrame:
     if not tokens:
         return df.iloc[0:0]
     return df[df[COL_LIBRAMIENTO].map(lambda v: norm(v) in tokens)]
- 
- 
+
+
+def split_new_records(df_new: pd.DataFrame, refs: list):
+    """Separa los registros de df_new que NO están (nuevos) / SÍ están (repetidos) en los documentos de referencia.
+
+    Dos registros son el mismo cuando comparten el mismo Código (sin importar mayúsculas, acentos ni espacios).
+    """
+    ref_codes = {norm(c) for ref in refs for c in ref[COL_CODIGO]}
+    repetido = df_new[COL_CODIGO].map(lambda c: norm(c) in ref_codes)
+    return df_new[~repetido], df_new[repetido]
+
+
 # ============================================================================
 # INTERFAZ STREAMLIT
 # ============================================================================
 st.set_page_config(page_title="Extractor de Códigos Revisados", page_icon="✅", layout="centered")
- 
- 
-# ----------------------------------------------------------------------------
-# Utilidades
-# ----------------------------------------------------------------------------
-def fetch_from_github(owner: str, repo: str, path: str, branch: str, token: str | None) -> bytes:
-    """Descarga un archivo de un repositorio de GitHub (público o privado con token)."""
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path.lstrip('/')}"
-    headers = {"Accept": "application/vnd.github.raw+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    resp = requests.get(url, headers=headers, params={"ref": branch}, timeout=30)
-    if resp.status_code == 404:
-        raise FileNotFoundError("No se encontró el archivo (revisa repositorio, ruta, rama o token).")
-    resp.raise_for_status()
-    return resp.content
- 
- 
-def get_secret_token() -> str | None:
-    try:
-        return st.secrets.get("GITHUB_TOKEN")
-    except Exception:  # no hay secrets.toml
-        return None
- 
- 
+
+COL_DOC = "Documento"
+
+
+@st.cache_data(show_spinner="Leyendo Excel…")
+def cargar_archivo(data: bytes, fname: str):
+    return extract_reviewed(data, fname)
+
+
 def copy_list_component(records: list[tuple[str, str]]):
-    """Un registro debajo del otro, cada uno con su botón de copiado."""
+    """Un registro debajo del otro, cada uno con su botón de copiado. records = [(código, detalle)]."""
     rows = "".join(
         f'<div class="row"><div class="info"><span class="code">{html.escape(code)}</span>'
-        + (f'<span class="lib">Libramiento: {html.escape(lib)}</span>' if lib else "")
+        + (f'<span class="lib">{html.escape(detail)}</span>' if detail else "")
         + f'</div><button class="btn" data-v="{html.escape(code, quote=True)}">Copiar</button></div>'
-        for code, lib in records
+        for code, detail in records
     )
-    all_text = json.dumps("\n".join(code for code, _ in records)).replace("</", "<\\/")
+    all_text = json.dumps("\n".join(code for code, _ in records)).replace("<", "\\u003c")
     page = f"""
     <style>
       body {{ margin:0; font-family: "Source Sans Pro", system-ui, sans-serif; }}
@@ -340,7 +616,7 @@ def copy_list_component(records: list[tuple[str, str]]):
               padding:8px 12px; margin-bottom:6px; }}
       .info {{ display:flex; flex-direction:column; min-width:0; }}
       .code {{ font-family: ui-monospace, Menlo, Consolas, monospace; font-weight:600; word-break:break-all; }}
-      .lib {{ font-size:12px; color:#656d76; }}
+      .lib {{ font-size:12px; color:#656d76; word-break:break-word; }}
       .btn {{ cursor:pointer; border:1px solid #d0d7de; background:#fff; color:#1f2328; border-radius:6px;
               padding:5px 12px; font-size:13px; white-space:nowrap; }}
       .btn:hover {{ border-color:#ff4b4b; color:#ff4b4b; }}
@@ -369,94 +645,88 @@ def copy_list_component(records: list[tuple[str, str]]):
       document.getElementById('copyall').addEventListener('click', e => copyText({all_text}, e.target));
     </script>
     """
-    height = min(len(records) * 56 + 60, 520)
-    components.html(page, height=height, scrolling=False)
- 
- 
-# ----------------------------------------------------------------------------
-# Interfaz
-# ----------------------------------------------------------------------------
+    height = min(len(records) * 62 + 60, 520)
+    if hasattr(st, "iframe"):  # Streamlit reciente (components.html está en desuso)
+        st.iframe(page, height=height)
+    else:
+        components.html(page, height=height, scrolling=False)
+
+
 st.title("✅ Extractor de Códigos Revisados")
 st.caption(
-    "Sube un Excel (.xlsx / .xls). Ambos formatos son compatibles. Se busca la columna **Revisada**, se toman las filas con "
+    "Sube uno o varios Excel (.xlsx / .xls). Se busca la columna **Revisada**, se toman las filas con "
     "**Verdadero** y se extraen sus **Códigos**."
 )
- 
-ok_xlrd, xlrd_info = _xlrd_diagnostic()
-with st.expander("🔧 Diagnóstico de compatibilidad .xls", expanded=False):
-    if ok_xlrd:
-        st.success(f"Compatibilidad .xls activa: {xlrd_info}")
-    else:
-        st.error("Compatibilidad .xls no disponible: xlrd no está instalado.")
-        st.code("xlrd>=2.0.1")
-        st.caption(
-            "Coloca esta dependencia en requirements.txt, en la raíz del repositorio, "
-            "y vuelve a desplegar la aplicación. Los archivos .xls no necesitan convertirse a .xlsx."
-        )
 
-origen = st.radio("Origen del archivo", ["Subir archivo", "Desde GitHub"], horizontal=True)
- 
-data, fname = None, None
- 
-if origen == "Subir archivo":
-    uploaded = st.file_uploader("Archivo Excel", type=["xlsx", "xls"])
-    if uploaded is not None:
-        data, fname = uploaded.getvalue(), uploaded.name
-else:
-    c1, c2 = st.columns(2)
-    owner = c1.text_input("Usuario / organización")
-    repo = c2.text_input("Repositorio")
-    c3, c4 = st.columns([3, 1])
-    path = c3.text_input("Ruta del archivo", placeholder="datos/reporte.xlsx")
-    branch = c4.text_input("Rama", value="main")
-    token = st.text_input(
-        "Token de GitHub (solo repos privados)",
-        type="password",
-        value="",
-        help="También puedes guardarlo como GITHUB_TOKEN en los secrets de Streamlit.",
-    ) or get_secret_token()
-    if st.button("Cargar desde GitHub", type="primary"):
-        if not (owner and repo and path):
-            st.warning("Completa usuario, repositorio y ruta.")
-        else:
-            try:
-                with st.spinner("Descargando…"):
-                    st.session_state["gh_data"] = (
-                        fetch_from_github(owner, repo, path, branch or "main", token),
-                        path.rsplit("/", 1)[-1],
-                    )
-            except Exception as exc:  # noqa: BLE001
-                st.session_state.pop("gh_data", None)
-                st.error(f"No se pudo descargar: {exc}")
-    if "gh_data" in st.session_state:
-        data, fname = st.session_state["gh_data"]
-        st.success(f"Archivo cargado: {fname}")
- 
-if data is None:
+uploaded = st.file_uploader(
+    "Archivos Excel",
+    type=["xlsx", "xls"],
+    accept_multiple_files=True,
+    help="El orden en que los subas define el Documento 1, 2, 3… (el 1.º es el más antiguo).",
+)
+if not uploaded:
     st.stop()
- 
-if not fname.lower().endswith((".xlsx", ".xls")):
-    st.error("El archivo debe ser .xlsx o .xls.")
+
+# ---- Lectura de cada documento (numerados en el orden de carga)
+docs, has_lib_any = [], False
+for i, f in enumerate(uploaded, start=1):
+    label = f"{i}. {f.name}"
+    try:
+        d, has_lib, notes = cargar_archivo(f.getvalue(), f.name)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"«{f.name}»: {exc}")
+        continue
+    for n in notes:
+        st.info(f"{f.name}: {n}")
+    has_lib_any = has_lib_any or has_lib
+    docs.append((label, d.assign(**{COL_DOC: label})))
+
+if not docs:
     st.stop()
- 
-try:
-    df, has_lib, notes = st.cache_data(show_spinner="Leyendo Excel…")(extract_reviewed)(data, fname)
-except Exception as exc:  # noqa: BLE001
-    st.error(str(exc))
-    st.stop()
- 
-for n in notes:
-    st.info(n)
- 
-st.metric("Registros con Revisada = Verdadero", len(df))
+
+multi = len(docs) > 1
+st.metric("Registros con Revisada = Verdadero", sum(len(d) for _, d in docs))
+if multi:
+    for label, d in docs:
+        st.caption(f"**{label}** — {len(d)} registros")
 st.divider()
- 
+
+# ---- Registros nuevos respecto a otros documentos
+solo_nuevos = st.checkbox(
+    "Identificar registros nuevos (exportar solo los que no se repiten del documento anterior)",
+    disabled=not multi,
+    help="Compara por Código. Los registros que ya estaban en el documento de referencia se excluyen.",
+)
+if not multi:
+    st.caption("Sube al menos 2 documentos para habilitar esta opción.")
+
+result = pd.concat([d for _, d in docs], ignore_index=True)
+
+if solo_nuevos:
+    labels = [label for label, _ in docs]
+    by_label = dict(docs)
+    nuevo_label = st.selectbox("Documento nuevo (el que se revisa)", labels, index=len(labels) - 1)
+    otros = [l for l in labels if l != nuevo_label]
+    ref_labels = st.multiselect("Comparar contra (documentos anteriores)", otros, default=otros)
+    if not ref_labels:
+        st.warning("Selecciona al menos un documento de referencia.")
+        st.stop()
+    nuevos, repetidos = split_new_records(by_label[nuevo_label], [by_label[l] for l in ref_labels])
+    m1, m2 = st.columns(2)
+    m1.metric("Nuevos", len(nuevos))
+    m2.metric("Repetidos (ya existían)", len(repetidos))
+    result = nuevos
+    if result.empty:
+        st.warning("No hay registros nuevos: todos los códigos del documento ya estaban en los de referencia.")
+        st.stop()
+
+st.divider()
+
+# ---- Filtro por Número Libramiento
 usar_filtro = st.checkbox("Aplicar Filtro de búsqueda para exportar.")
- 
-result = df
 if usar_filtro:
-    if not has_lib:
-        st.error("El archivo no tiene una columna de «Libramiento» para filtrar.")
+    if not has_lib_any:
+        st.error("Los archivos no tienen una columna de «Libramiento» para filtrar.")
         st.stop()
     libramiento = st.text_input(
         "Número Libramiento(*)",
@@ -465,17 +735,27 @@ if usar_filtro:
     if not libramiento.strip():
         st.warning("Escribe el Número Libramiento(*) para exportar los códigos relacionados.")
         st.stop()
-    result = filter_by_libramiento(df, libramiento)
- 
+    result = filter_by_libramiento(result, libramiento)
+
 if result.empty:
     st.warning("No hay códigos para exportar con los criterios indicados.")
     st.stop()
- 
-records = list(zip(result[COL_CODIGO], result[COL_LIBRAMIENTO]))
- 
+
+
+def _detalle(row) -> str:
+    partes = []
+    if row[COL_LIBRAMIENTO]:
+        partes.append(f"Libramiento: {row[COL_LIBRAMIENTO]}")
+    if multi:
+        partes.append(f"Documento: {row[COL_DOC]}")
+    return " · ".join(partes)
+
+
+records = [(row[COL_CODIGO], _detalle(row)) for _, row in result.iterrows()]
+
 st.subheader(f"Exportación ({len(records)} código{'s' if len(records) != 1 else ''})")
 copy_list_component(records)
- 
+
 d1, d2 = st.columns(2)
 d1.download_button(
     "⬇️ Descargar TXT",
@@ -486,9 +766,8 @@ d1.download_button(
 )
 d2.download_button(
     "⬇️ Descargar CSV",
-    result.to_csv(index=False).encode("utf-8-sig"),
+    result[[COL_DOC, COL_HOJA, COL_CODIGO, COL_LIBRAMIENTO]].to_csv(index=False).encode("utf-8-sig"),
     file_name="codigos.csv",
     mime="text/csv",
     use_container_width=True,
 )
- 
