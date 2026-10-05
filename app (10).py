@@ -597,15 +597,18 @@ def cargar_archivo(data: bytes, fname: str):
     return extract_reviewed(data, fname)
 
 
-def copy_list_component(records: list[tuple[str, str]]):
-    """Un registro debajo del otro, cada uno con su botón de copiado. records = [(código, detalle)]."""
+def copy_list_component(records: list[tuple[str, str, str]]):
+    """Un registro debajo del otro, cada uno con su botón de copiado.
+
+    records = [(código, detalle, texto_a_copiar)]
+    """
     rows = "".join(
         f'<div class="row"><div class="info"><span class="code">{html.escape(code)}</span>'
         + (f'<span class="lib">{html.escape(detail)}</span>' if detail else "")
-        + f'</div><button class="btn" data-v="{html.escape(code, quote=True)}">Copiar</button></div>'
-        for code, detail in records
+        + f'</div><button class="btn" data-v="{html.escape(copy_text, quote=True)}">Copiar</button></div>'
+        for code, detail, copy_text in records
     )
-    all_text = json.dumps("\n".join(code for code, _ in records)).replace("<", "\\u003c")
+    all_text = json.dumps("\n".join(ct for _, _, ct in records)).replace("<", "\\u003c")
     page = f"""
     <style>
       body {{ margin:0; font-family: "Source Sans Pro", system-ui, sans-serif; }}
@@ -751,7 +754,12 @@ def _detalle(row) -> str:
     return " · ".join(partes)
 
 
-records = [(row[COL_CODIGO], _detalle(row)) for _, row in result.iterrows()]
+def _texto_copiar(row) -> str:
+    """Código de trámite + Número de Libramiento (separados por tabulador: al pegar en Excel quedan en 2 columnas)."""
+    return f"{row[COL_CODIGO]}\t{row[COL_LIBRAMIENTO]}" if row[COL_LIBRAMIENTO] else row[COL_CODIGO]
+
+
+records = [(row[COL_CODIGO], _detalle(row), _texto_copiar(row)) for _, row in result.iterrows()]
 
 st.subheader(f"Exportación ({len(records)} código{'s' if len(records) != 1 else ''})")
 copy_list_component(records)
