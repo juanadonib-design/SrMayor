@@ -1,269 +1,34 @@
+"""Extractor de Códigos Revisados (Streamlit) — archivo único.
+ 
+- Lee .xlsx y .xls (todas las hojas).
+- Detecta automáticamente la fila de encabezados (donde estén "Revisada" y "Código").
+- Extrae los códigos de las filas donde Revisada = Verdadero.
+- Permite subir varios archivos e identificar los registros nuevos respecto a otros documentos.
+- Permite filtrar por Número Libramiento y copiar cada registro.
+ 
+Ejecutar:  streamlit run app.py
+"""
 import html
 import io
 import json
 import re
 import unicodedata
-from io import BytesIO
-
+ 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.utils import get_column_letter
-
-# ======================================================
-# FUNCIÓN: BLOQUEAR LETRAS (SOLO NÚMEROS)
-# ======================================================
-def solo_numeros(key):
-    valor = st.session_state.get(key, "")
-    st.session_state[key] = re.sub(r"\D", "", valor)
-
-# ======================================================
-# CONFIGURACIÓN
-# ======================================================
-st.set_page_config(
-    page_title="DRCC DATA UNIFY",
-    page_icon="📊",
-    layout="wide"
-)
-
-# ======================================================
-# ESTILOS
-# ======================================================
-st.markdown("""
-<style>
-.main-title { color:#1E3A8A; font-size:42px; font-weight:bold; margin-bottom:0; }
-.sub-title { color:#333; font-size:20px; font-weight:600; margin-top:5px; }
-</style>
-""", unsafe_allow_html=True)
-
-# ======================================================
-# ENCABEZADO
-# ======================================================
-st.markdown('<p class="main-title">DRCC DATA UNIFY</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-title">Creado por Juan Adonai Brito, | Idea: Chabellys Encarnacion</p>', unsafe_allow_html=True)
-st.markdown(
-    '<p style="color:#555; font-size:16px;">'
-    'Ahorra tiempo al unificar estructuras programáticas y libramientos en SIGEF.'
-    '</p>',
-    unsafe_allow_html=True
-)
-st.divider()
-
-# ======================================================
-# BASE DE DATOS: NUEVOS FUNCIONARIOS DESIGNADOS
-# (Decretos 551-26 al 558-26)
-# ======================================================
-FUNCIONARIOS_NUEVOS = [
-    {
-        "aliases": ["INTRANT", "INSTITUTO NACIONAL DE TRANSITO Y TRANSPORTE TERRESTRE"],
-        "funcionarios": [
-            {"nombre": "Juan Manuel Méndez García", "cargo": "Director Ejecutivo", "decreto": "551-26"},
-        ],
-    },
-    {
-        "aliases": ["COE", "CENTRO DE OPERACIONES DE EMERGENCIA"],
-        "funcionarios": [
-            {"nombre": "Erdwin Robert Olivares Luciano", "cargo": "Director", "decreto": "551-26"},
-        ],
-    },
-    {
-        "aliases": ["DEFENSA CIVIL"],
-        "funcionarios": [
-            {"nombre": "Carlos Manuel Paulino Cárdenas", "cargo": "Director Ejecutivo", "decreto": "551-26"},
-        ],
-    },
-    {
-        "aliases": ["JAC", "JUNTA DE AVIACION CIVIL"],
-        "funcionarios": [
-            {"nombre": "Julio Peña Guzmán", "cargo": "Presidente", "decreto": "552-26"},
-        ],
-    },
-    {
-        "aliases": ["DEPARTAMENTO AEROPORTUARIO"],
-        "funcionarios": [
-            {"nombre": "Mérido de Jesús Torres Espinal", "cargo": "Director Ejecutivo", "decreto": "552-26"},
-        ],
-    },
-    {
-        "aliases": ["MERCADOM", "MERCADOS DOMINICANOS DE ABASTO AGROPECUARIO"],
-        "funcionarios": [
-            {"nombre": "Mariana Tavarez de Santos", "cargo": "Directora General", "decreto": "552-26"},
-        ],
-    },
-    {
-        "aliases": ["INAIPI", "INSTITUTO NACIONAL DE ATENCION INTEGRAL A LA PRIMERA INFANCIA"],
-        "funcionarios": [
-            {"nombre": "Kenia Xiomara Guante Valdez", "cargo": "Directora", "decreto": "553-26"},
-        ],
-    },
-    {
-        "aliases": ["INSTITUTO NACIONAL DE MIGRACION"],
-        "funcionarios": [
-            {"nombre": "José Benedicto Hernández Tejada", "cargo": "Director Ejecutivo", "decreto": "553-26"},
-        ],
-    },
-    {
-        "aliases": ["MIREX", "MINISTERIO DE RELACIONES EXTERIORES", "RELACIONES EXTERIORES"],
-        "funcionarios": [
-            {"nombre": "Víctor O. Disonó Haza", "cargo": "Ministro", "decreto": "554-26"},
-        ],
-    },
-    {
-        "aliases": ["MINISTERIO DE VIVIENDA", "MINISTERIO DE LA VIVIENDA, HABITAT Y EDIFICACIONES (MIVHED)", "MIVHED"],
-        "funcionarios": [
-            {"nombre": "Jean Luis Rodríguez", "cargo": "Ministro", "decreto": "554-26"},
-        ],
-    },
-    {
-        "aliases": ["AUTORIDAD PORTUARIA DOMINICANA", "AUTORIDAD PORTUARIA", "APORDOM"],
-        "funcionarios": [
-            {"nombre": "Francisco Alejandro Campos Alvarez", "cargo": "Director Ejecutivo", "decreto": "554-26"},
-            {"nombre": "Julia Luz Marina Múñiz Suberví", "cargo": "Presidente Consejo de Administración", "decreto": "554-26"},
-        ],
-    },
-    {
-        "aliases": ["DIRECCION DE DESARROLLO PROVINCIAL"],
-        "funcionarios": [
-            {"nombre": "José Dolores Andújar Ramírez", "cargo": "Director", "decreto": "555-26"},
-        ],
-    },
-    {
-        "aliases": ["UTEPDA", "UNIDAD TECNICA EJECUTORA DE PROYECTOS DE DESARROLLO AGROFORESTAL"],
-        "funcionarios": [
-            {"nombre": "Nidio Encarnación Santiago", "cargo": "Director Ejecutivo", "decreto": "555-26"},
-        ],
-    },
-    {
-        "aliases": ["CORAASAN", "CORPORACION DEL ACUEDUCTO Y ALCANTARILLADO DE SANTIAGO"],
-        "funcionarios": [
-            {"nombre": "César Andrés Pichardo Fermín", "cargo": "Presidente", "decreto": "555-26"},
-            {"nombre": "Bernardo Antonio Inoa Pichardo", "cargo": "Miembro Consejo de Directores", "decreto": "555-26"},
-        ],
-    },
-    {
-        "aliases": ["CUED", "CONSEJO UNIFICADO DE LAS EMPRESAS DISTRIBUIDORAS DE ELECTRICIDAD"],
-        "funcionarios": [
-            {"nombre": "Joel Adrián Santos Echavarría", "cargo": "Presidente / Coordinador Gabinete de Energía", "decreto": "556-26"},
-        ],
-    },
-    {
-        "aliases": ["FUERZA AEREA", "FARD", "FUERZA AEREA DE LA REPUBLICA DOMINICANA"],
-        "funcionarios": [
-            {"nombre": "Enmanuel Marcelino Souffront Tamayo", "cargo": "Comandante General", "decreto": "557-26"},
-            {"nombre": "Manuel José Brito Estepan", "cargo": "Subcomandante General", "decreto": "557-26"},
-            {"nombre": "Dionisio De La Rosa Hernández", "cargo": "Inspector General", "decreto": "557-26"},
-        ],
-    },
-    {
-        "aliases": [ "FUERZAS ARMADAS" , "MINISTERIO DE DEFENSA"],
-        "funcionarios": [
-            {"nombre": "Jorge Iván Camino Pérez", "cargo": "Inspector General de las Fuerzas Armadas", "decreto": "557-26"},
-            {"nombre": "Delio Buenaventura Colón Rosario", "cargo": "Viceministro de Defensa", "decreto": "557-26"},
-        ],
-    },
-    {
-        "aliases": ["EJERCITO DE LA REPUBLICA DOMINICANA", "EJERCITO", "ERD"],
-        "funcionarios": [
-            {"nombre": "Jimmy Arias Grullón", "cargo": "Comandante General", "decreto": "557-26"},
-            {"nombre": "José Manuel Duran Infante", "cargo": "Subcomandante General", "decreto": "557-26"},
-            {"nombre": "Raúl Esteban Mora Hernández", "cargo": "Inspector General", "decreto": "557-26"},
-            {"nombre": "Rafael Raimundo Ramírez Tejeda", "cargo": "Comandante Regimiento Guardia Presidencial", "decreto": "557-26"},
-        ],
-    },
-    {
-        "aliases": ["CUSEP", "CUERPO DE SEGURIDAD PRESIDENCIAL"],
-        "funcionarios": [
-            {"nombre": "Guillermo Caro Cruz", "cargo": "Jefe", "decreto": "557-26"},
-        ],
-    },
-    {
-        "aliases": ["POLICIA NACIONAL"],
-        "funcionarios": [
-            {"nombre": "Ernesto Rafael Rodríguez García", "cargo": "Director General", "decreto": "558-26"},
-            {"nombre": "Martín Miguel Tapia Sánchez", "cargo": "Inspector General", "decreto": "574-26"},
-        ],
-    },
-    {
-        "aliases": ["SUPERINTENDENCIA DE BANCOS"],
-        "funcionarios": [
-            {"nombre": "Víctor Livio Enmanuel Cedeño Brea", "cargo": "Superintendente de Bancos", "decreto": "606-26"},
-        ],
-    },
-    {
-        "aliases": ["HOSPITAL MATERNO DR. REYNALDO ALMANZAR"],
-        "funcionarios": [
-            {"nombre": "Dr. Jorge Vilorio", "cargo": "Director Ejecutivo", "decreto": "1"},
-        ],
-    },
-    {
-        "aliases": ["HOSPITAL MUNICIPAL LILIAN FERNÁNDEZ", "LILIAN"],
-        "funcionarios": [
-            {"nombre": "Juan Carlos Gómez", "cargo": "Director Ejecutivo", "decreto": "1"},
-        ],
-    },
-    {
-        "aliases": ["HOSPITAL MUNICIPAL DR. JORGE A. MARTINEZ ", "ICO", "JORGE ARMANDO", "HOSPITAL MUNICIPAL DE TAMBORIL", "JORGE ARMANDO MARTINEZ"],
-        "funcionarios": [
-            {"nombre": "José Luis Gómez Rodríguez", "cargo": "Director Ejecutivo", "decreto": "1"},
-        ],
-    },
-]
-
-# ======================================================
-# HELPERS: NORMALIZACIÓN Y DETECCIÓN DE FUNCIONARIOS
-# ======================================================
-def normalizar(texto):
-    if texto is None:
-        return ""
-    texto = str(texto).upper().strip()
-    texto = unicodedata.normalize("NFKD", texto)
-    texto = "".join(c for c in texto if not unicodedata.combining(c))
-    texto = re.sub(r"[^A-Z0-9\s]", " ", texto)
-    texto = re.sub(r"\s+", " ", texto).strip()
-    return texto
-
-def buscar_funcionario_nuevo(texto_institucion):
-    """Devuelve (nombres_funcionarios, decretos) si la institución coincide, si no (None, None)."""
-    texto_norm = normalizar(texto_institucion)
-    if not texto_norm:
-        return None, None
-
-    for entrada in FUNCIONARIOS_NUEVOS:
-        for alias in entrada["aliases"]:
-            alias_norm = normalizar(alias)
-            patron = r"\b" + re.escape(alias_norm) + r"\b"
-            if re.search(patron, texto_norm) or re.search(
-                r"\b" + re.escape(texto_norm) + r"\b", alias_norm
-            ):
-                nombres = "; ".join(
-                    f"{f['nombre']} ({f['cargo']})" for f in entrada["funcionarios"]
-                )
-                decretos = ", ".join(
-                    sorted(set(f["decreto"] for f in entrada["funcionarios"]))
-                )
-                return nombres, decretos
-    return None, None
-
-def detectar_columna(cols, claves):
-    for col in cols:
-        col_texto = str(col).strip().lower()
-        if any(k in col_texto for k in claves):
-            return col
-    return None
-
+ 
 # ============================================================================
-# EXTRACTOR DE CÓDIGOS REVISADOS — LÓGICA
+# LÓGICA DE EXTRACCIÓN
 # ============================================================================
 COL_HOJA = "Hoja"
 COL_CODIGO = "Código"
 COL_LIBRAMIENTO = "Número Libramiento"
-COL_DOC = "Documento"
-
+ 
 _TRUE_VALUES = {"verdadero", "true"}
-
-
+ 
+ 
 def norm(value) -> str:
     """Minúsculas, sin acentos y sin espacios repetidos."""
     if value is None:
@@ -276,8 +41,8 @@ def norm(value) -> str:
     s = unicodedata.normalize("NFKD", str(value))
     s = "".join(c for c in s if not unicodedata.combining(c))
     return re.sub(r"\s+", " ", s).strip().lower()
-
-
+ 
+ 
 def clean_value(value) -> str:
     """Convierte una celda a texto limpio (123.0 -> '123')."""
     if value is None:
@@ -291,14 +56,14 @@ def clean_value(value) -> str:
         return str(int(value))
     s = str(value).strip()
     return "" if s.lower() in {"nan", "none", "nat"} else s
-
-
+ 
+ 
 def is_true(value) -> bool:
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
     return norm(value) in _TRUE_VALUES
-
-
+ 
+ 
 def _find(headers, exact=(), startswith=(), contains=()):
     for i, h in enumerate(headers):
         if h in exact:
@@ -310,8 +75,8 @@ def _find(headers, exact=(), startswith=(), contains=()):
         if any(c in h for c in contains):
             return i
     return None
-
-
+ 
+ 
 def _find_header_row(raw: pd.DataFrame, max_rows: int = 40):
     for i in range(min(max_rows, len(raw))):
         headers = [norm(v) for v in raw.iloc[i].tolist()]
@@ -320,8 +85,8 @@ def _find_header_row(raw: pd.DataFrame, max_rows: int = 40):
         if i_rev is not None and i_cod is not None:
             return i, headers, i_rev, i_cod
     return None
-
-
+ 
+ 
 def _col_index(ref: str) -> int:
     """'AB12' -> 27 (índice de columna base 0)."""
     n = 0
@@ -330,32 +95,32 @@ def _col_index(ref: str) -> int:
             break
         n = n * 26 + (ord(ch.upper()) - 64)
     return n - 1
-
-
+ 
+ 
 def _read_xlsx_stdlib(data: bytes) -> dict:
     """Lector de .xlsx sin dependencias (zipfile + xml). Devuelve {hoja: DataFrame}."""
     import posixpath
     import xml.etree.ElementTree as ET
     import zipfile
-
+ 
     ns = {
         "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
         "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
         "pr": "http://schemas.openxmlformats.org/package/2006/relationships",
     }
     rid_attr = "{%s}id" % ns["r"]
-
+ 
     def text_of(el) -> str:
         return "".join(t.text or "" for t in el.iter("{%s}t" % ns["m"]))
-
+ 
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         names = set(z.namelist())
-
+ 
         shared = []
         if "xl/sharedStrings.xml" in names:
             root = ET.fromstring(z.read("xl/sharedStrings.xml"))
             shared = [text_of(si) for si in root.findall("m:si", ns)]
-
+ 
         rels = {}
         if "xl/_rels/workbook.xml.rels" in names:
             for rel in ET.fromstring(z.read("xl/_rels/workbook.xml.rels")).findall("pr:Relationship", ns):
@@ -363,7 +128,7 @@ def _read_xlsx_stdlib(data: bytes) -> dict:
                 rels[rel.get("Id")] = (
                     target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
                 )
-
+ 
         wb = ET.fromstring(z.read("xl/workbook.xml"))
         out = {}
         for i, sh in enumerate(wb.findall("m:sheets/m:sheet", ns), start=1):
@@ -404,8 +169,8 @@ def _read_xlsx_stdlib(data: bytes) -> dict:
                     grid[r_idx][c_idx] = val
             out[name] = pd.DataFrame(grid, dtype=object)
         return out
-
-
+ 
+ 
 _OLE_SIG = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
@@ -766,12 +531,12 @@ def _read_all_sheets(data: bytes, filename: str):
 
 def extract_reviewed(data: bytes, filename: str):
     """Devuelve (DataFrame, hay_libramiento, notas).
-
+ 
     El DataFrame tiene las columnas: Hoja, Código, Número Libramiento.
     """
     sheets = _read_all_sheets(data, filename)
     frames, notes, has_lib = [], [], False
-
+ 
     for name, raw in sheets.items():
         found = _find_header_row(raw)
         if found is None:
@@ -780,7 +545,7 @@ def extract_reviewed(data: bytes, filename: str):
         h, headers, i_rev, i_cod = found
         i_lib = _find(headers, exact=("numero libramiento",), contains=("libramiento",))
         has_lib = has_lib or i_lib is not None
-
+ 
         body = raw.iloc[h + 1 :]
         sel = body[body.iloc[:, i_rev].map(is_true)]
         out = pd.DataFrame(
@@ -792,15 +557,15 @@ def extract_reviewed(data: bytes, filename: str):
         )
         out = out[out[COL_CODIGO] != ""]
         frames.append(out)
-
+ 
     if not frames:
         raise ValueError(
             "No se encontró ninguna hoja con las columnas «Revisada» y «Código». "
             + " ".join(notes)
         )
     return pd.concat(frames, ignore_index=True), has_lib, notes
-
-
+ 
+ 
 def filter_by_libramiento(df: pd.DataFrame, text: str) -> pd.DataFrame:
     """Filtra por uno o varios Números de Libramiento (separados por coma, espacio o ;)."""
     tokens = {norm(t) for t in re.split(r"[,\s;]+", text.strip()) if t}
@@ -819,12 +584,20 @@ def split_new_records(df_new: pd.DataFrame, refs: list):
     return df_new[~repetido], df_new[repetido]
 
 
+# ============================================================================
+# INTERFAZ STREAMLIT
+# ============================================================================
+st.set_page_config(page_title="Extractor de Códigos Revisados", page_icon="✅", layout="centered")
+
+COL_DOC = "Documento"
+
+
 @st.cache_data(show_spinner="Leyendo Excel…")
 def cargar_archivo(data: bytes, fname: str):
     return extract_reviewed(data, fname)
 
 
-def copy_list_component(records: list):
+def copy_list_component(records: list[tuple[str, str, str]]):
     """Un registro debajo del otro, cada uno con su botón de copiado.
 
     records = [(código, detalle, texto_a_copiar)]
@@ -882,460 +655,127 @@ def copy_list_component(records: list):
         components.html(page, height=height, scrolling=False)
 
 
-def render_extractor():
-    """Interfaz del modo 'Extractor de códigos revisados'.
-
-    Usa return (no st.stop) para que el resto de la app, como el pie de página, siga mostrándose.
-    """
-    st.subheader("✅ Extractor de códigos revisados")
-    st.caption(
-        "Sube uno o varios Excel (.xlsx / .xls). Se busca la columna **Revisada**, se toman las filas con "
-        "**Verdadero** y se extraen sus **Códigos**."
-    )
-
-    uploaded = st.file_uploader(
-        "Archivos Excel",
-        type=["xlsx", "xls"],
-        accept_multiple_files=True,
-        key="ext_files",
-        help="El orden en que los subas define el Documento 1, 2, 3… (el 1.º es el más antiguo).",
-    )
-    if not uploaded:
-        return
-
-    # ---- Lectura de cada documento (numerados en el orden de carga)
-    docs, has_lib_any = [], False
-    for i, f in enumerate(uploaded, start=1):
-        label = f"{i}. {f.name}"
-        try:
-            d, has_lib, notes = cargar_archivo(f.getvalue(), f.name)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"«{f.name}»: {exc}")
-            continue
-        for n in notes:
-            st.info(f"{f.name}: {n}")
-        has_lib_any = has_lib_any or has_lib
-        docs.append((label, d.assign(**{COL_DOC: label})))
-
-    if not docs:
-        return
-
-    multi = len(docs) > 1
-    st.metric("Registros con Revisada = Verdadero", sum(len(d) for _, d in docs))
-    if multi:
-        for label, d in docs:
-            st.caption(f"**{label}** — {len(d)} registros")
-    st.divider()
-
-    # ---- Registros nuevos respecto a otros documentos
-    solo_nuevos = st.checkbox(
-        "Identificar registros nuevos (exportar solo los que no se repiten del documento anterior)",
-        key="ext_solo_nuevos",
-        disabled=not multi,
-        help="Compara por Código. Los registros que ya estaban en el documento de referencia se excluyen.",
-    )
-    if not multi:
-        st.caption("Sube al menos 2 documentos para habilitar esta opción.")
-
-    result = pd.concat([d for _, d in docs], ignore_index=True)
-
-    if solo_nuevos:
-        labels = [label for label, _ in docs]
-        by_label = dict(docs)
-        nuevo_label = st.selectbox(
-            "Documento nuevo (el que se revisa)", labels, index=len(labels) - 1, key="ext_nuevo"
-        )
-        otros = [l for l in labels if l != nuevo_label]
-        ref_labels = st.multiselect(
-            "Comparar contra (documentos anteriores)", otros, default=otros, key="ext_refs"
-        )
-        if not ref_labels:
-            st.warning("Selecciona al menos un documento de referencia.")
-            return
-        nuevos, repetidos = split_new_records(by_label[nuevo_label], [by_label[l] for l in ref_labels])
-        m1, m2 = st.columns(2)
-        m1.metric("Nuevos", len(nuevos))
-        m2.metric("Repetidos (ya existían)", len(repetidos))
-        result = nuevos
-        if result.empty:
-            st.warning("No hay registros nuevos: todos los códigos del documento ya estaban en los de referencia.")
-            return
-
-    st.divider()
-
-    # ---- Filtro por Número Libramiento
-    usar_filtro = st.checkbox("Aplicar Filtro de búsqueda para exportar.", key="ext_usar_filtro")
-    if usar_filtro:
-        if not has_lib_any:
-            st.error("Los archivos no tienen una columna de «Libramiento» para filtrar.")
-            return
-        libramiento_filtro = st.text_input(
-            "Número Libramiento(*)",
-            placeholder="Ej.: 1234 (puedes escribir varios separados por coma)",
-            key="ext_libramiento",
-        )
-        if not libramiento_filtro.strip():
-            st.warning("Escribe el Número Libramiento(*) para exportar los códigos relacionados.")
-            return
-        result = filter_by_libramiento(result, libramiento_filtro)
-
-    if result.empty:
-        st.warning("No hay códigos para exportar con los criterios indicados.")
-        return
-
-    def _detalle(row) -> str:
-        partes = []
-        if row[COL_LIBRAMIENTO]:
-            partes.append(f"Libramiento: {row[COL_LIBRAMIENTO]}")
-        if multi:
-            partes.append(f"Documento: {row[COL_DOC]}")
-        return " · ".join(partes)
-
-    def _texto_copiar(row) -> str:
-        """Código de trámite + Número de Libramiento (separados por tabulador: al pegar en Excel quedan en 2 columnas)."""
-        return f"{row[COL_CODIGO]}\t{row[COL_LIBRAMIENTO]}" if row[COL_LIBRAMIENTO] else row[COL_CODIGO]
-
-    records = [(row[COL_CODIGO], _detalle(row), _texto_copiar(row)) for _, row in result.iterrows()]
-
-    st.subheader(f"Exportación ({len(records)} código{'s' if len(records) != 1 else ''})")
-    copy_list_component(records)
-
-    d1, d2 = st.columns(2)
-    d1.download_button(
-        "⬇️ Descargar TXT",
-        "\n".join(result[COL_CODIGO]),
-        file_name="codigos.txt",
-        mime="text/plain",
-        use_container_width=True,
-    )
-    d2.download_button(
-        "⬇️ Descargar CSV",
-        result[[COL_DOC, COL_HOJA, COL_CODIGO, COL_LIBRAMIENTO]].to_csv(index=False).encode("utf-8-sig"),
-        file_name="codigos.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-# ======================================================
-# SELECCIÓN DE MODO
-# ======================================================
-modo = st.radio(
-    "🧭 Selecciona el modo de trabajo",
-    [
-        "🔁 Modo múltiple (Excel)",
-        "🧩 Modo manual (uno por uno)",
-        "✅ Extractor de códigos revisados",
-    ],
-    horizontal=True
+st.title("✅ Extractor de Códigos Revisados")
+st.caption(
+    "Sube uno o varios Excel (.xlsx / .xls). Se busca la columna **Revisada**, se toman las filas con "
+    "**Verdadero** y se extraen sus **Códigos**."
 )
 
+uploaded = st.file_uploader(
+    "Archivos Excel",
+    type=["xlsx", "xls"],
+    accept_multiple_files=True,
+    help="El orden en que los subas define el Documento 1, 2, 3… (el 1.º es el más antiguo).",
+)
+if not uploaded:
+    st.stop()
+
+# ---- Lectura de cada documento (numerados en el orden de carga)
+docs, has_lib_any = [], False
+for i, f in enumerate(uploaded, start=1):
+    label = f"{i}. {f.name}"
+    try:
+        d, has_lib, notes = cargar_archivo(f.getvalue(), f.name)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"«{f.name}»: {exc}")
+        continue
+    for n in notes:
+        st.info(f"{f.name}: {n}")
+    has_lib_any = has_lib_any or has_lib
+    docs.append((label, d.assign(**{COL_DOC: label})))
+
+if not docs:
+    st.stop()
+
+multi = len(docs) > 1
+st.metric("Registros con Revisada = Verdadero", sum(len(d) for _, d in docs))
+if multi:
+    for label, d in docs:
+        st.caption(f"**{label}** — {len(d)} registros")
 st.divider()
 
-# ======================================================
-# MODO MÚLTIPLE
-# ======================================================
-if modo.startswith("🔁"):
+# ---- Registros nuevos respecto a otros documentos
+solo_nuevos = st.checkbox(
+    "Identificar registros nuevos (exportar solo los que no se repiten del documento anterior)",
+    disabled=not multi,
+    help="Compara por Código. Los registros que ya estaban en el documento de referencia se excluyen.",
+)
+if not multi:
+    st.caption("Sube al menos 2 documentos para habilitar esta opción.")
 
-    col1, col2 = st.columns([1, 2], gap="large")
+result = pd.concat([d for _, d in docs], ignore_index=True)
 
-    # Inicializar variables
-    df = None
-    override = False
-
-    with col1:
-        st.info("### 📂 Cargar archivo Excel")
-        uploaded_file = st.file_uploader("Subir archivo (.xlsx / .xls)", type=["xlsx", "xls"])
-
-        if uploaded_file:
-            try:
-                # Leer archivo completo sin asumir encabezado
-                uploaded_file.seek(0)
-                df_raw = pd.read_excel(uploaded_file, header=None, dtype=str).fillna("")
-
-                # Función más precisa para detectar encabezado real
-                def detectar_header(df_temp):
-                    for i in range(min(6, len(df_temp))):
-                        fila = df_temp.iloc[i].astype(str).str.lower()
-                        if any("estructura" in c for c in fila) and any("libramiento" in c for c in fila):
-                            return i
-                    return None
-
-                header_row = detectar_header(df_raw)
-
-                if header_row is not None:
-                    uploaded_file.seek(0)
-                    df = pd.read_excel(uploaded_file, header=header_row, dtype=str).fillna("")
-                else:
-                    df = df_raw.copy()
-                    df.columns = [f"Columna_{i+1}" for i in range(len(df.columns))]
-
-                st.success("✅ Archivo cargado correctamente")
-
-                override = st.checkbox("✏️ Manual")
-
-            except Exception as e:
-                st.error(f"Error al leer el archivo: {e}")
-
-    with col2:
-        if df is None:
-            st.warning("Esperando archivo para procesar...")
-        else:
-            try:
-                columnas = list(df.columns)
-                col_estructura = None
-                col_libramiento = None
-
-                # Lógica: Si es manual (override) mostramos tabla y selectores.
-                # Si es automático, NO mostramos tabla, solo procesamos.
-                if override:
-                    st.info("Modo manual activado.")
-                    st.subheader("👀 Vista previa de los datos")
-                    st.dataframe(df.head(20), use_container_width=True)
-
-                    col_estructura = st.selectbox(
-                        "Selecciona la columna de Estructura Programática",
-                        columnas
-                    )
-                    col_libramiento = st.selectbox(
-                        "Selecciona la columna de Número de Libramiento",
-                        columnas
-                    )
-                else:
-                    # Detección automática (sin vista previa)
-                    col_estructura = detectar_columna(df.columns, ["estructura", "programática", "programatica"])
-                    col_libramiento = detectar_columna(df.columns, ["libramiento", "número", "numero"])
-
-                # Procesamiento
-                if not col_estructura or not col_libramiento:
-                    st.error("❌ No se pudieron identificar las columnas automáticamente. Activa la casilla manual.")
-                else:
-                    # Si estamos en automático, mostramos qué columnas eligió el sistema
-                    if not override:
-                        st.caption(f"✅ Columnas detectadas: **{col_estructura}** y **{col_libramiento}**")
-
-                    def transformar(fila):
-                        v1 = str(fila[col_estructura]) if pd.notna(fila[col_estructura]) else ""
-                        v2 = str(fila[col_libramiento]) if pd.notna(fila[col_libramiento]) else ""
-
-                        v1 = v1.strip().split('.')[0]
-                        v2 = v2.strip().split('.')[0]
-
-                        v1 = re.sub(r"\D", "", v1).zfill(12)
-
-                        if v1 == "000000000000" or not v2:
-                            return ""
-                        return f"{v1[:4]}.{v1[4:6]}.{v1[8:]}.{v2}"
-
-                    resultados = df.apply(transformar, axis=1)
-                    validos = resultados[resultados != ""]
-
-                    if not validos.empty:
-                        resultado_final = ";".join(validos)
-                        st.success("✔️ Datos unificados correctamente")
-                        st.metric("📊 Registros unificados", len(validos))
-
-                        # Usamos st.code para mantener el botón de copiar
-                        st.code(resultado_final, language=None)
-                    else:
-                        st.warning("⚠️ No se encontraron datos válidos.")
-
-                    # ======================================================
-                    # BOTÓN: GENERAR REPORTE DE NUEVOS FUNCIONARIOS
-                    # ======================================================
-                    st.divider()
-                    st.subheader("📋 Reporte de instituciones con nuevos funcionarios")
-
-                    col_institucion = detectar_columna(df.columns, ["institucion", "institución"])
-                    col_entidad = detectar_columna(df.columns, ["entidad contratante", "entidad"])
-                    col_razon_social = detectar_columna(df.columns, ["razon social", "razón social"])
-                    col_tipo = detectar_columna(df.columns, ["tipo"])
-                    col_monto = detectar_columna(df.columns, ["monto neto", "monto"])
-                    col_odc = detectar_columna(df.columns, ["odc", "certificacion de contrato", "certificación de contrato"])
-                    col_moneda = detectar_columna(df.columns, ["moneda"])
-
-                    # Para cada fila se usa: Institución si tiene valor, si no
-                    # Entidad Contratante, si no Razón Social.
-                    def obtener_institucion(fila):
-                        for col in (col_institucion, col_entidad, col_razon_social):
-                            if col and pd.notna(fila[col]) and str(fila[col]).strip():
-                                return str(fila[col]).strip()
-                        return ""
-
-                    if not (col_institucion or col_entidad or col_razon_social):
-                        st.warning(
-                            "⚠️ No se encontró una columna de Institución, Entidad Contratante o Razón Social "
-                            "en el archivo. No es posible generar el reporte."
-                        )
-                    else:
-                        df_institucion_vista = df.apply(
-                            lambda fila: pd.Series({
-                                "Institución": fila[col_institucion] if col_institucion else "",
-                                "Entidad Contratante": fila[col_entidad] if col_entidad else "",
-                                "Valor usado": obtener_institucion(fila),
-                            }),
-                            axis=1,
-                        )
-
-                        filas_reporte = []
-                        for _, fila in df.iterrows():
-                            texto_institucion = obtener_institucion(fila)
-                            nombres_func, decretos = buscar_funcionario_nuevo(texto_institucion)
-
-                            filas_reporte.append({
-                                "Nuevo Funcionario": nombres_func or "",
-                                "Decreto": decretos or "",
-                                "Nombre de la Institución": texto_institucion,
-                                "Tipo": fila[col_tipo] if col_tipo else "",
-                                "Estructura Programática": fila[col_estructura] if col_estructura else "",
-                                "Monto Neto": fila[col_monto] if col_monto else "",
-                                "Número Libramiento(*)": fila[col_libramiento] if col_libramiento else "",
-                                "#ODC/Certificación de Contrato(*)": fila[col_odc] if col_odc else "",
-                                "Moneda": fila[col_moneda] if col_moneda else "",
-                                "Razón Social": fila[col_razon_social] if col_razon_social else "",
-                                "Expediente Trabajado": "",
-                                "_match": bool(nombres_func),
-                            })
-
-                        df_reporte_completo = pd.DataFrame(filas_reporte)
-                        total_coincidencias = int(df_reporte_completo["_match"].sum())
-
-                        # Solo se conservan las filas con institución de nuevo funcionario
-                        df_reporte = df_reporte_completo[df_reporte_completo["_match"]].reset_index(drop=True)
-
-                        if total_coincidencias:
-                            st.success(
-                                f"✔️ Reporte generado — {total_coincidencias} registro(s) "
-                                f"con institución de nuevo funcionario, resaltado en amarillo."
-                            )
-                        else:
-                            st.info(
-                                "El reporte se generó, pero ninguna institución del archivo "
-                                "coincide con la lista de nuevos funcionarios."
-                            )
-
-                        # --------------------------------------------
-                        # CONSTRUIR EXCEL CON RESALTADO AMARILLO
-                        # --------------------------------------------
-                        df_salida = df_reporte.drop(columns=["_match"])
-
-                        buffer = BytesIO()
-                        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                            df_salida.to_excel(writer, index=False, sheet_name="Reporte")
-                            ws = writer.sheets["Reporte"]
-
-                            amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-                            header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
-                            header_font = Font(color="FFFFFF", bold=True)
-
-                            n_cols = len(df_salida.columns)
-
-                            # Encabezado
-                            for c in range(1, n_cols + 1):
-                                celda = ws.cell(row=1, column=c)
-                                celda.fill = header_fill
-                                celda.font = header_font
-                                celda.alignment = Alignment(horizontal="center", vertical="center")
-
-                            # Resaltar filas con coincidencia
-                            for i, coincide in enumerate(df_reporte["_match"], start=2):
-                                if coincide:
-                                    for c in range(1, n_cols + 1):
-                                        ws.cell(row=i, column=c).fill = amarillo
-
-                            # Ancho de columnas automático
-                            for c in range(1, n_cols + 1):
-                                letra = get_column_letter(c)
-                                max_len = max(
-                                    [len(str(df_salida.iloc[r, c - 1])) for r in range(len(df_salida))]
-                                    + [len(str(df_salida.columns[c - 1]))]
-                                )
-                                ws.column_dimensions[letra].width = min(max_len + 3, 45)
-
-                            ws.freeze_panes = "A2"
-
-                        buffer.seek(0)
-
-                        st.dataframe(
-                            df_salida.style.apply(
-                                lambda row: [
-                                    "background-color: #FFF9B0" if df_reporte.loc[row.name, "_match"] else ""
-                                    for _ in row
-                                ],
-                                axis=1,
-                            ),
-                            use_container_width=True,
-                        )
-
-                        st.download_button(
-                            label="⬇️ Descargar Reporte en Excel",
-                            data=buffer,
-                            file_name="Reporte_Nuevos_Funcionarios.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
-
-            except Exception as e:
-                st.error(f"Error en unificación: {e}")
-
-# ======================================================
-# MODO MANUAL (AUTOMÁTICO + BLOQUEO DE LETRAS)
-# ======================================================
-if modo.startswith("🧩"):
-
-    st.subheader("🧩 Unificación manual")
-    st.caption("Ideal cuando el volumen de trabajo es bajo")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.text_input(
-            "Estructura Programática (12 dígitos)",
-            placeholder="Ej: 010203040506",
-            key="estructura",
-            on_change=solo_numeros,
-            args=("estructura",)
-        )
-
-    with col2:
-        st.text_input(
-            "Número de Libramiento (1 o 5 dígitos)",
-            placeholder="Ej: 1234 o 12345",
-            key="libramiento",
-            on_change=solo_numeros,
-            args=("libramiento",)
-        )
-
-    estructura = st.session_state.get("estructura", "")
-    libramiento = st.session_state.get("libramiento", "")
-
-    # 🔄 VALIDACIÓN + UNIFICACIÓN AUTOMÁTICA
-    if estructura and libramiento:
-
-        errores = False
-
-        if len(estructura) != 12:
-            st.error("❌ La Estructura Programática debe tener exactamente 12 dígitos")
-            errores = True
-
-        if not (1 <= len(libramiento) <= 5):
-            st.error("❌ El Número de Libramiento debe tener entre 1 y 5 dígitos")
-            errores = True
-
-        if not errores:
-            resultado = (
-                f"{estructura[:4]}."
-                f"{estructura[4:6]}."
-                f"{estructura[8:]}."
-                f"{libramiento}"
-            )
-
-            st.success("✔️ Unificación automática exitosa")
-            st.code(resultado, language=None)
-
-# ======================================================
-# MODO EXTRACTOR DE CÓDIGOS REVISADOS
-# ======================================================
-if modo.startswith("✅"):
-    render_extractor()
+if solo_nuevos:
+    labels = [label for label, _ in docs]
+    by_label = dict(docs)
+    nuevo_label = st.selectbox("Documento nuevo (el que se revisa)", labels, index=len(labels) - 1)
+    otros = [l for l in labels if l != nuevo_label]
+    ref_labels = st.multiselect("Comparar contra (documentos anteriores)", otros, default=otros)
+    if not ref_labels:
+        st.warning("Selecciona al menos un documento de referencia.")
+        st.stop()
+    nuevos, repetidos = split_new_records(by_label[nuevo_label], [by_label[l] for l in ref_labels])
+    m1, m2 = st.columns(2)
+    m1.metric("Nuevos", len(nuevos))
+    m2.metric("Repetidos (ya existían)", len(repetidos))
+    result = nuevos
+    if result.empty:
+        st.warning("No hay registros nuevos: todos los códigos del documento ya estaban en los de referencia.")
+        st.stop()
 
 st.divider()
-st.caption("DRCC DATA UNIFY - Herramienta diseñada para agilizar el proceso de firma en SIGEF")
+
+# ---- Filtro por Número Libramiento
+usar_filtro = st.checkbox("Aplicar Filtro de búsqueda para exportar.")
+if usar_filtro:
+    if not has_lib_any:
+        st.error("Los archivos no tienen una columna de «Libramiento» para filtrar.")
+        st.stop()
+    libramiento = st.text_input(
+        "Número Libramiento(*)",
+        placeholder="Ej.: 1234 (puedes escribir varios separados por coma)",
+    )
+    if not libramiento.strip():
+        st.warning("Escribe el Número Libramiento(*) para exportar los códigos relacionados.")
+        st.stop()
+    result = filter_by_libramiento(result, libramiento)
+
+if result.empty:
+    st.warning("No hay códigos para exportar con los criterios indicados.")
+    st.stop()
+
+
+def _detalle(row) -> str:
+    partes = []
+    if row[COL_LIBRAMIENTO]:
+        partes.append(f"Libramiento: {row[COL_LIBRAMIENTO]}")
+    if multi:
+        partes.append(f"Documento: {row[COL_DOC]}")
+    return " · ".join(partes)
+
+
+def _texto_copiar(row) -> str:
+    """Código de trámite + Número de Libramiento (separados por tabulador: al pegar en Excel quedan en 2 columnas)."""
+    return f"{row[COL_CODIGO]}\t{row[COL_LIBRAMIENTO]}" if row[COL_LIBRAMIENTO] else row[COL_CODIGO]
+
+
+records = [(row[COL_CODIGO], _detalle(row), _texto_copiar(row)) for _, row in result.iterrows()]
+
+st.subheader(f"Exportación ({len(records)} código{'s' if len(records) != 1 else ''})")
+copy_list_component(records)
+
+d1, d2 = st.columns(2)
+d1.download_button(
+    "⬇️ Descargar TXT",
+    "\n".join(result[COL_CODIGO]),
+    file_name="codigos.txt",
+    mime="text/plain",
+    use_container_width=True,
+)
+d2.download_button(
+    "⬇️ Descargar CSV",
+    result[[COL_DOC, COL_HOJA, COL_CODIGO, COL_LIBRAMIENTO]].to_csv(index=False).encode("utf-8-sig"),
+    file_name="codigos.csv",
+    mime="text/csv",
+    use_container_width=True,
+)
